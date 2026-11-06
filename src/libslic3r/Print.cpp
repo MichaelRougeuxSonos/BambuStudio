@@ -183,6 +183,8 @@ bool Print::invalidate_state_by_config_options(const ConfigOptionResolver & /* n
         "retract_lift_above",
         "retract_lift_below",
         "slow_down_layer_time",
+        "layer_time_max_delta",
+        "layer_time_delta_pause",
         "standby_temperature_delta",
         "machine_start_gcode",
         "filament_start_gcode",

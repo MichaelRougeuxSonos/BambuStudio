@@ -2480,6 +2480,9 @@ void GCode::_do_export(Print& print, GCodeOutputStream &file, ThumbnailsGenerato
     PROFILE_FUNC();
 
     m_print = &print;
+    // The layer time limit measures the layers with a probe of the G-code reader, which has to see what was written before them.
+    if (print.config().layer_time_max_delta.value > 0.)
+        file.start_recording();
     m_timelapse_pos_picker.init(&print,m_writer.get_xy_offset().cast<coord_t>());
     // init as filament map
     update_layer_related_config(0);
@@ -3824,6 +3827,84 @@ void GCode::set_extrude_acceleration(bool is_first_layer)
     }
 }
 
+// Keep two adjacent layers within max_delta seconds of each other, in the time model of the G-code reader: that is what the
+// preview and the print time estimates show, and unlike the plain length / feedrate time of the cooling code it includes
+// acceleration, tool changes and so on. measure() returns those times for the layers the way they would be written right now.
+// Short layers are slowed down first, and a pause after the layer makes up for whatever slowing down could not add
+// (prime tower, minimum print speed, ...). layer_time stays the time the cooling works with, so the fan ignores the pause.
+template<class LayerResults, class Measure>
+static void apply_layer_time_delta_limit(LayerResults                                      &layers,
+                                         std::vector<std::vector<PerExtruderAdjustments>> &layers_extruder_adjustments,
+                                         CoolingBuffer                                    &cooling_processor,
+                                         const float                                       max_delta,
+                                         const bool                                        allow_pause,
+                                         Measure                                         &&measure)
+{
+    constexpr float tolerance = 0.25f;
+    // The list can hold entries without any G-code (for example a trailing empty layer). They are not layers of the
+    // printed file and the G-code reader does not count them, so only the entries that start a layer take part.
+    std::vector<size_t> real;
+    real.reserve(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i)
+        if (layers[i].gcode.find("; CHANGE_LAYER") != std::string::npos)
+            real.push_back(i);
+
+    // When printing by object, the layers of the objects before this one come first.
+    const auto measure_real = [&]() {
+        std::vector<float> times = measure();
+        if (times.size() > real.size())
+            times.erase(times.begin(), times.end() - real.size());
+        return times;
+    };
+    std::vector<float> times = measure_real();
+    if (times.size() != real.size()) {
+        BOOST_LOG_TRIVIAL(warning) << "Layer time limit skipped: measured " << times.size() << " layer times for " << real.size() << " layers";
+        return;
+    }
+    // Slowing a layer down adds less than asked when acceleration or the minimum print speed limits it,
+    // so measure again and ask for what is still missing.
+    for (int round = 0; round < 3; ++round) {
+        std::vector<float> targets = times;
+        limit_layer_time_delta(targets, max_delta);
+
+        bool stretched = false;
+        for (size_t k = 1; k < real.size(); ++k) {
+            const float missing = targets[k] - times[k];
+            if (missing <= tolerance)
+                continue;
+            auto       &layer   = layers[real[k]];
+            const float before  = layer.layer_time;
+            const float reached = cooling_processor.stretch_layer_time(layers_extruder_adjustments[layer.gcode_store_pos], before + missing);
+            if (reached > before + 0.01f) {
+                layer.layer_time = reached;
+                stretched        = true;
+            }
+        }
+        if (!stretched)
+            break;
+        times = measure_real();
+        if (times.size() != real.size())
+            return;
+    }
+
+    const std::vector<float> shortfalls = layer_time_shortfalls(times, max_delta);
+    size_t short_layers = 0;
+    double short_total  = 0.;
+    // The last layer has no layer after it to wait for.
+    for (size_t k = 1; k + 1 < real.size(); ++k) {
+        if (shortfalls[k] <= tolerance)
+            continue;
+        ++short_layers;
+        short_total += shortfalls[k];
+        BOOST_LOG_TRIVIAL(info) << "Layer time limit: layer " << k << " takes " << times[k] << " s after slowing down, " << shortfalls[k] << " s short"
+                                << (allow_pause ? ", pausing" : "");
+        if (allow_pause)
+            layers[real[k]].dwell_time = shortfalls[k];
+    }
+    BOOST_LOG_TRIVIAL(info) << "Layer time limit " << max_delta << " s: " << short_layers << " layers still short by " << short_total << " s in total"
+                            << (allow_pause ? ", made up with pauses" : "");
+}
+
 // Process all layers of all objects (non-sequential mode) with a parallel pipeline:
 // Generate G-code, run the filters (vase mode, cooling buffer), run the G-code analyser
 // and export G-code into file.
@@ -3916,21 +3997,18 @@ void GCode::process_layers(
     // step 5: rewite
     const auto write_gocde= tbb::make_filter<GCode::LayerResult, std::string>(slic3r_tbb_filtermode::serial_in_order,
     [&gcode_editer = *this->m_gcode_editer.get(), &layers_extruder_adjustments](GCode::LayerResult in) -> std::string {
-         return gcode_editer.write_layer_gcode(std::move(in.gcode), in.not_set_additional_fan, in.layer_id, in.layer_time, layers_extruder_adjustments[in.gcode_store_pos]);
+         return gcode_editer.write_layer_gcode(std::move(in.gcode), in.not_set_additional_fan, in.layer_id, in.layer_time, layers_extruder_adjustments[in.gcode_store_pos], in.dwell_time);
     });
 
     std::vector<GCode::LayerResult> gcode_res;
 
-    // BBS: apply new feedrate of outwall and recalculate layer time
+    // BBS: write the layers with their final layer times
     int layer_idx = 0;
-     const auto calculate_layer_time= tbb::make_filter<void, GCode::LayerResult>(slic3r_tbb_filtermode::serial_in_order, [&layer_idx, &smooth_calculator, &layers_extruder_adjustments, &gcode_res](tbb::flow_control& fc) -> GCode::LayerResult {
+     const auto calculate_layer_time= tbb::make_filter<void, GCode::LayerResult>(slic3r_tbb_filtermode::serial_in_order, [&layer_idx, &gcode_res](tbb::flow_control& fc) -> GCode::LayerResult {
          if(layer_idx == gcode_res.size()){
             fc.stop();
             return{};
         }else{
-             if (layer_idx > 0){
-                gcode_res[layer_idx].layer_time = smooth_calculator.recaculate_layer_time(layer_idx, layers_extruder_adjustments[gcode_res[layer_idx].gcode_store_pos]);
-             }
              return gcode_res[layer_idx++];
         }
         });
@@ -3943,23 +4021,50 @@ void GCode::process_layers(
     // The pipeline elements are joined using const references, thus no copying is performed.
     if (m_spiral_vase)
         tbb::parallel_pipeline(12, generator & spiral_mode & parsing & cooling & write_gocde & output);
-    else if (!m_config.z_direction_outwall_speed_continuous)
+    else if (!m_config.z_direction_outwall_speed_continuous && m_config.layer_time_max_delta.value <= 0.)
         tbb::parallel_pipeline(12, generator & parsing & cooling & write_gocde & output);
     else {
+        const bool  smooth_z        = m_config.z_direction_outwall_speed_continuous;
+        const float max_layer_delta = float(m_config.layer_time_max_delta.value);
         tbb::parallel_pipeline(12, generator & parsing & cooling & build_node);
         std::string message;
-        message = _L("Smoothing z direction speed");
+        message = smooth_z ? _L("Smoothing z direction speed") : _L("Smoothing layer time");
         m_print->set_status(85, message);
         //append data
         for (const LayerResult &res : layers_results) {
             //remove empty gcode layer caused by support independent layers
             if (res.cooling_buffer_flush) {
-                smooth_calculator.append_data(layers_wall_collection[res.gcode_store_pos]);
+                if (smooth_z)
+                    smooth_calculator.append_data(layers_wall_collection[res.gcode_store_pos]);
                 gcode_res.push_back(std::move(res));
             }
         }
 
-        smooth_calculator.smooth_layer_speed();
+        if (smooth_z) {
+            smooth_calculator.smooth_layer_speed();
+            // BBS: apply the new feedrate of outwall and recalculate layer time
+            for (size_t i = 1; i < gcode_res.size(); ++i)
+                gcode_res[i].layer_time = smooth_calculator.recaculate_layer_time(int(i), layers_extruder_adjustments[gcode_res[i].gcode_store_pos]);
+        }
+        if (max_layer_delta > 0.f) {
+            // The layer times the G-code reader will report for the layers as they are right now:
+            // a throwaway processor, set up like the one of the export, reads the layers the way they would be written.
+            const auto measure = [this, &print, &output_stream, &gcode_res, &layers_extruder_adjustments]() {
+                GCodeProcessor probe;
+                bool           silent = false;
+                DoExport::init_gcode_processor(print.config(), probe, silent, m_writer.extruders(), print.get_nozzle_group_result());
+                probe.initialize("");
+                // What the real processor has seen so far matters: the time of a tool change depends on the state before it.
+                probe.process_buffer(output_stream.recorded());
+                GCodeEditor probe_editor(*this);
+                for (const LayerResult &layer : gcode_res)
+                    probe.process_buffer(probe_editor.write_layer_gcode(layer.gcode, layer.not_set_additional_fan, layer.layer_id, layer.layer_time,
+                                                                        layers_extruder_adjustments[layer.gcode_store_pos]));
+                probe.finalize(false);
+                return probe.get_layers_time(PrintEstimatedStatistics::ETimeMode::Normal);
+            };
+            apply_layer_time_delta_limit(gcode_res, layers_extruder_adjustments, cooling_processor, max_layer_delta, m_config.layer_time_delta_pause.value, measure);
+        }
         message = _L("Exporting G-code");
         m_print->set_status(90, message);
         tbb::parallel_pipeline(12, calculate_layer_time & write_gocde & output);
@@ -4058,22 +4163,19 @@ void GCode::process_layers(
     // step 5: rewite
     const auto write_gocde= tbb::make_filter<GCode::LayerResult, std::string>(slic3r_tbb_filtermode::serial_in_order,
     [&gcode_editer = *this->m_gcode_editer.get(), &layers_extruder_adjustments](GCode::LayerResult in) -> std::string {
-         return gcode_editer.write_layer_gcode(std::move(in.gcode), in.not_set_additional_fan, in.layer_id, in.layer_time, layers_extruder_adjustments[in.gcode_store_pos]);
+         return gcode_editer.write_layer_gcode(std::move(in.gcode), in.not_set_additional_fan, in.layer_id, in.layer_time, layers_extruder_adjustments[in.gcode_store_pos], in.dwell_time);
     });
 
     std::vector<GCode::LayerResult> gcode_res;
 
-     // BBS: apply new feedrate of outwall and recalculate layer time
+     // BBS: write the layers with their final layer times
      int layer_idx = 0;
      //restart pipeline
-     const auto calculate_layer_time = tbb::make_filter<void, GCode::LayerResult>(slic3r_tbb_filtermode::serial_in_order, [&layer_idx, &gcode_res, &smooth_calculator, &layers_extruder_adjustments](tbb::flow_control& fc) -> GCode::LayerResult {
+     const auto calculate_layer_time = tbb::make_filter<void, GCode::LayerResult>(slic3r_tbb_filtermode::serial_in_order, [&layer_idx, &gcode_res](tbb::flow_control& fc) -> GCode::LayerResult {
          if(layer_idx == gcode_res.size()){
             fc.stop();
             return{};
         }else{
-             if (layer_idx > 0) {
-                gcode_res[layer_idx].layer_time = smooth_calculator.recaculate_layer_time(layer_idx, layers_extruder_adjustments[gcode_res[layer_idx].gcode_store_pos]);
-             }
              return gcode_res[layer_idx++];
         }
         });
@@ -4086,9 +4188,11 @@ void GCode::process_layers(
     // The pipeline elements are joined using const references, thus no copying is performed.
     if (m_spiral_vase)
         tbb::parallel_pipeline(12, generator & spiral_mode & parsing & cooling & write_gocde & output);
-    else if (!m_config.z_direction_outwall_speed_continuous)
+    else if (!m_config.z_direction_outwall_speed_continuous && m_config.layer_time_max_delta.value <= 0.)
         tbb::parallel_pipeline(12, generator & parsing & cooling & write_gocde & output);
     else {
+        const bool  smooth_z        = m_config.z_direction_outwall_speed_continuous;
+        const float max_layer_delta = float(m_config.layer_time_max_delta.value);
         tbb::parallel_pipeline(12, generator & parsing & cooling & build_node);
         // step 4.2: smoothing
         // break pipeline and do z smoothing
@@ -4096,12 +4200,37 @@ void GCode::process_layers(
         for (const LayerResult &res : layers_results) {
             // remove empty gcode layer caused by support independent layers
             if (res.cooling_buffer_flush) {
-                smooth_calculator.append_data(layers_wall_collection[res.gcode_store_pos]);
+                if (smooth_z)
+                    smooth_calculator.append_data(layers_wall_collection[res.gcode_store_pos]);
                 gcode_res.push_back(res);
             }
         }
 
-        smooth_calculator.smooth_layer_speed();
+        if (smooth_z) {
+            smooth_calculator.smooth_layer_speed();
+            // BBS: apply the new feedrate of outwall and recalculate layer time
+            for (size_t i = 1; i < gcode_res.size(); ++i)
+                gcode_res[i].layer_time = smooth_calculator.recaculate_layer_time(int(i), layers_extruder_adjustments[gcode_res[i].gcode_store_pos]);
+        }
+        if (max_layer_delta > 0.f) {
+            // The layer times the G-code reader will report for the layers as they are right now:
+            // a throwaway processor, set up like the one of the export, reads the layers the way they would be written.
+            const auto measure = [this, &print, &output_stream, &gcode_res, &layers_extruder_adjustments]() {
+                GCodeProcessor probe;
+                bool           silent = false;
+                DoExport::init_gcode_processor(print.config(), probe, silent, m_writer.extruders(), print.get_nozzle_group_result());
+                probe.initialize("");
+                // What the real processor has seen so far matters: the time of a tool change depends on the state before it.
+                probe.process_buffer(output_stream.recorded());
+                GCodeEditor probe_editor(*this);
+                for (const LayerResult &layer : gcode_res)
+                    probe.process_buffer(probe_editor.write_layer_gcode(layer.gcode, layer.not_set_additional_fan, layer.layer_id, layer.layer_time,
+                                                                        layers_extruder_adjustments[layer.gcode_store_pos]));
+                probe.finalize(false);
+                return probe.get_layers_time(PrintEstimatedStatistics::ETimeMode::Normal);
+            };
+            apply_layer_time_delta_limit(gcode_res, layers_extruder_adjustments, cooling_processor, max_layer_delta, m_config.layer_time_delta_pause.value, measure);
+        }
 
         tbb::parallel_pipeline(12, calculate_layer_time & write_gocde & output);
     }
@@ -7111,6 +7240,8 @@ void GCode::GCodeOutputStream::write(const char *what)
         const size_t len = ::strlen(gcode);
         if (::fwrite(gcode, 1, len, this->f) != len && m_write_errno == 0)
             m_write_errno = errno;
+        if (m_recording)
+            m_recorded.append(gcode, len);
         //FIXME don't allocate a string, maybe process a batch of lines?
         m_processor.process_buffer(std::string(gcode));
     }

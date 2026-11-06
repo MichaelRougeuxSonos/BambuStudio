@@ -3,6 +3,8 @@
 #include "../libslic3r.h"
 #include <libslic3r/GCode/GCodeEditor.hpp>
 #include <math.h>
+#include <string>
+#include <vector>
 
 namespace Slic3r {
 
@@ -97,6 +99,37 @@ private:
     double                                          filter_sum                     = .0f;
     float                                           layer_time_smoothing_threshold = 30.0f;
 };
+
+// Raise layer times so that no two adjacent layers differ by more than max_delta seconds.
+// Times are only ever increased, and a layer constrains its neighbours by its real time (no cap).
+// Layers before first_layer are neither raised nor used as a constraint.
+void limit_layer_time_delta(std::vector<float> &times, float max_delta, size_t first_layer = 1);
+
+// How much time each layer still lacks to satisfy the delta limit (zero for layers that are fine).
+std::vector<float> layer_time_shortfalls(const std::vector<float> &times, float max_delta, size_t first_layer = 1);
+
+// Parameters of a pause that is appended to a layer to make up for layer time that slowing down could not add.
+struct LayerTimePause
+{
+    // Time the pause should add to the layer, including the moves it needs.
+    float  seconds = 0.f;
+    // Z of the layer that has just been printed, and the highest Z the printer can reach.
+    double z                       = 0.;
+    double max_z                   = 0.;
+    double retract_length          = 0.;
+    // mm/s; the deretraction speed falls back to the retraction speed when it is zero.
+    double retract_speed           = 0.;
+    double deretract_speed         = 0.;
+    bool   use_firmware_retraction = false;
+    // The filament is only retracted with relative E distances, or with firmware retraction.
+    bool   relative_e              = true;
+};
+
+// Retract, lift the nozzle away from the print, wait and come back. Empty if the pause is too short to matter.
+std::string layer_time_pause_gcode(const LayerTimePause &pause);
+
+// Z of the last "; Z_HEIGHT: " comment in the G-code of a layer.
+bool layer_gcode_z(const std::string &gcode, double &z);
 
 } // namespace Slic3r
 

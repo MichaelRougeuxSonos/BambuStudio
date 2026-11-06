@@ -348,4 +348,44 @@ float CoolingBuffer::calculate_layer_slowdown(std::vector<PerExtruderAdjustments
 
     return elapsed_time_total0;
 }
+
+// A line that still has room to be slowed down: it moves, and has not reached the minimum print speed yet.
+static inline bool can_stretch(const CoolingLine &line, bool include_external_perimeters)
+{
+    return line.time > 0.f && line.length > 0.f && line.adjustable(include_external_perimeters);
+}
+
+float CoolingBuffer::stretch_layer_time(std::vector<PerExtruderAdjustments> &per_extruder_adjustments, float target_time)
+{
+    float total = 0.f;
+    for (const PerExtruderAdjustments &adj : per_extruder_adjustments)
+        total += adj.elapsed_time_total();
+
+    // Slow down everything but the external perimeters first, and only touch those if that is not enough.
+    for (bool include_external_perimeters : {false, true}) {
+        // Lines clamped at their minimum speed drop out of the next iteration, so a few passes converge.
+        for (int iter = 0; iter < 8 && total < target_time - 0.01f; ++iter) {
+            float stretchable = 0.f;
+            for (const PerExtruderAdjustments &adj : per_extruder_adjustments)
+                for (const CoolingLine &line : adj.lines)
+                    if (can_stretch(line, include_external_perimeters))
+                        stretchable += line.time;
+            if (stretchable <= EPSILON)
+                break;
+
+            const float factor = 1.f + (target_time - total) / stretchable;
+            total              = 0.f;
+            for (PerExtruderAdjustments &adj : per_extruder_adjustments)
+                for (CoolingLine &line : adj.lines) {
+                    if (can_stretch(line, include_external_perimeters)) {
+                        line.time     = std::min(line.time_max, line.time * factor);
+                        line.feedrate = line.length / line.time;
+                        line.slowdown = true;
+                    }
+                    total += line.time;
+                }
+        }
+    }
+    return total;
+}
 }

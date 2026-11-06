@@ -1,5 +1,7 @@
 #include "../GCode.hpp"
 #include "GCodeEditor.hpp"
+#include "Smoothing.hpp"
+#include <cmath>
 #include <boost/algorithm/string/predicate.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <iostream>
@@ -385,7 +387,9 @@ std::string GCodeEditor::write_layer_gcode(
     // Total time of this layer after slow down, used to control the fan.
     float                                   layer_time,
     // Per extruder list of G-code lines and their cool down attributes.
-    std::vector<PerExtruderAdjustments>    &per_extruder_adjustments)
+    std::vector<PerExtruderAdjustments>    &per_extruder_adjustments,
+    // Time to wait after the last move of the layer.
+    float                                   pause_seconds)
 {
     if (gcode.empty())
         return gcode;
@@ -700,6 +704,19 @@ std::string GCodeEditor::write_layer_gcode(
     const char *gcode_end = gcode.c_str() + gcode.size();
     if (pos < gcode_end)
         new_gcode.append(pos, gcode_end - pos);
+
+    LayerTimePause pause;
+    if (pause_seconds > 0.f && layer_gcode_z(gcode, pause.z)) {
+        const auto positive = [](double v) { return std::isfinite(v) && v > 0. ? v : 0.; };
+        pause.seconds                 = pause_seconds;
+        pause.max_z                   = m_config.printable_height.value;
+        pause.retract_length          = positive(m_config.retraction_length.get_at(m_current_extruder));
+        pause.retract_speed           = positive(m_config.retraction_speed.get_at(m_current_extruder));
+        pause.deretract_speed         = positive(m_config.deretraction_speed.get_at(m_current_extruder));
+        pause.use_firmware_retraction = m_config.use_firmware_retraction.value;
+        pause.relative_e              = m_config.use_relative_e_distances.value;
+        new_gcode += layer_time_pause_gcode(pause);
+    }
 
     return new_gcode;
 }

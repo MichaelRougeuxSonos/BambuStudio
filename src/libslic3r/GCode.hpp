@@ -319,9 +319,16 @@ private:
         // Formats and write into a file the given data.
         void write_format(const char* format, ...);
 
+        // Keep a copy of everything written from now on (header, start G-code, the layers so far), so that a probe of the
+        // G-code reader can start from the same state as the one fed by this stream.
+        void               start_recording() { m_recording = true; }
+        const std::string &recorded() const { return m_recorded; }
+
     private:
         FILE *f = nullptr;
         GCodeProcessor &m_processor;
+        bool            m_recording = false;
+        std::string     m_recorded;
         // errno captured at the first failed fwrite/fflush, 0 if none.
         int  m_write_errno = 0;
     };
@@ -344,6 +351,8 @@ private:
         size_t      gcode_store_pos = 0;
         //store each layer_time
         float       layer_time = 0;
+        // Time to wait after this layer, to keep it within the max layer time difference of its neighbours.
+        float       dwell_time = 0;
         bool   not_set_additional_fan { false };
         LayerResult() = default;
         LayerResult(const std::string& gcode_, const size_t layer_id_, const bool spiral_vase_enable_, const bool cooling_buffer_flush_, const size_t gcode_store_pos_ = static_cast<size_t>(-1)) :
@@ -357,6 +366,7 @@ private:
             cooling_buffer_flush = other.cooling_buffer_flush;
             gcode_store_pos = other.gcode_store_pos;
             layer_time     = other.layer_time;
+            dwell_time     = other.dwell_time;
             not_set_additional_fan = other.not_set_additional_fan;
         }
 

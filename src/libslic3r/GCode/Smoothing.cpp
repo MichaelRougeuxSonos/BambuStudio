@@ -1,4 +1,7 @@
 #include "Smoothing.hpp"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace Slic3r {
 
@@ -219,6 +222,106 @@ void SmoothCalculator::smooth_layer_time()
         step_count++;
         filter_layer_time();
     }
+}
+
+void limit_layer_time_delta(std::vector<float> &times, float max_delta, size_t first_layer)
+{
+    if (max_delta <= 0.f || times.size() < first_layer + 2)
+        return;
+
+    // After a forward and a backward sweep, times[i] == max over j of (original[j] - max_delta * |i - j|).
+    for (size_t i = first_layer + 1; i < times.size(); ++i)
+        times[i] = std::max(times[i], times[i - 1] - max_delta);
+    for (size_t i = times.size() - 1; i > first_layer; --i)
+        times[i - 1] = std::max(times[i - 1], times[i] - max_delta);
+}
+
+std::vector<float> layer_time_shortfalls(const std::vector<float> &times, float max_delta, size_t first_layer)
+{
+    std::vector<float> limited = times;
+    limit_layer_time_delta(limited, max_delta, first_layer);
+    for (size_t i = 0; i < limited.size(); ++i)
+        limited[i] -= times[i];
+    return limited;
+}
+
+std::string layer_time_pause_gcode(const LayerTimePause &pause)
+{
+    // Shorter pauses are not worth the extra moves.
+    constexpr float  min_pause_seconds = 0.5f;
+    constexpr double lift_speed        = 10.; // mm/s
+    constexpr double max_lift          = 5.;  // mm
+    if (pause.seconds < min_pause_seconds)
+        return {};
+
+    // A short wait is not worth retracting and lifting the nozzle for.
+    constexpr float min_lift_pause_seconds = 3.f;
+    if (pause.seconds < min_lift_pause_seconds) {
+        char short_buf[128];
+        std::snprintf(short_buf, sizeof(short_buf), "; LAYER_TIME_PAUSE_START %.1f s\nG4 P%.0f\n; LAYER_TIME_PAUSE_END\n", double(pause.seconds),
+                      double(pause.seconds) * 1000.);
+        return short_buf;
+    }
+
+    double lift = std::min(max_lift, pause.max_z - pause.z);
+    if (lift < 0.2)
+        lift = 0.;
+    const bool retract = pause.use_firmware_retraction || (pause.relative_e && pause.retract_length > 0. && pause.retract_speed > 0.);
+    const double deretract_speed = pause.deretract_speed > 0. ? pause.deretract_speed : pause.retract_speed;
+
+    // The moves take time too, so the wait itself is shortened by it.
+    double move_time = 2. * lift / lift_speed;
+    if (retract && !pause.use_firmware_retraction)
+        move_time += pause.retract_length / pause.retract_speed + pause.retract_length / deretract_speed;
+    const double wait = std::max(0., double(pause.seconds) - move_time);
+
+    char buf[160];
+    std::string out;
+    std::snprintf(buf, sizeof(buf), "; LAYER_TIME_PAUSE_START %.1f s\n", double(pause.seconds));
+    out += buf;
+    if (retract) {
+        if (pause.use_firmware_retraction)
+            out += "G10\n";
+        else {
+            std::snprintf(buf, sizeof(buf), "G1 E-%.5g F%.0f\n", pause.retract_length, pause.retract_speed * 60.);
+            out += buf;
+        }
+    }
+    if (lift > 0.) {
+        std::snprintf(buf, sizeof(buf), "G1 Z%.3f F%.0f\n", pause.z + lift, lift_speed * 60.);
+        out += buf;
+    }
+    std::snprintf(buf, sizeof(buf), "G4 P%.0f\n", wait * 1000.);
+    out += buf;
+    if (lift > 0.) {
+        std::snprintf(buf, sizeof(buf), "G1 Z%.3f F%.0f\n", pause.z, lift_speed * 60.);
+        out += buf;
+    }
+    if (retract) {
+        if (pause.use_firmware_retraction)
+            out += "G11\n";
+        else {
+            std::snprintf(buf, sizeof(buf), "G1 E%.5g F%.0f\n", pause.retract_length, deretract_speed * 60.);
+            out += buf;
+        }
+    }
+    out += "; LAYER_TIME_PAUSE_END\n";
+    return out;
+}
+
+bool layer_gcode_z(const std::string &gcode, double &z)
+{
+    static const std::string tag = "; Z_HEIGHT: ";
+    const size_t pos = gcode.rfind(tag);
+    if (pos == std::string::npos)
+        return false;
+    const char *begin = gcode.c_str() + pos + tag.size();
+    char       *end   = nullptr;
+    const double value = std::strtod(begin, &end);
+    if (end == begin)
+        return false;
+    z = value;
+    return true;
 }
 
 } // namespace Slic3r

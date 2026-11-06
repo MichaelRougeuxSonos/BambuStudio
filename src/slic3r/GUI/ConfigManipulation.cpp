@@ -950,6 +950,8 @@ void ConfigManipulation::toggle_print_fff_options(DynamicPrintConfig *config, in
     toggle_line("spiral_mode_smooth", has_spiral_vase);
     toggle_line("spiral_mode_max_xy_smoothing", config->opt_bool("spiral_mode_smooth"));
     toggle_field("z_direction_outwall_speed_continuous", !has_spiral_vase);
+    toggle_field("layer_time_max_delta", !has_spiral_vase);
+    toggle_field("layer_time_delta_pause", !has_spiral_vase && config->opt_float("layer_time_max_delta") > 0.);
     bool has_top_solid_infill 	 = config->opt_int("top_shell_layers") > 0;
     bool has_bottom_solid_infill = config->opt_int("bottom_shell_layers") > 0;
     bool has_solid_infill 		 = has_top_solid_infill || has_bottom_solid_infill;

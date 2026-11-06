@@ -444,7 +444,8 @@ public:
     // float       calculate_layer_slowdown(std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
     // Apply slow down over G-code lines stored in per_extruder_adjustments, enable fan if needed.
     // Returns the adjusted G-code.
-    std::string write_layer_gcode(const std::string &gcode, const bool &not_set_additional_fan, size_t layer_id, float layer_time, std::vector<PerExtruderAdjustments> &per_extruder_adjustments);
+    // pause_seconds > 0 appends a retract, lift and wait after the last move of the layer.
+    std::string write_layer_gcode(const std::string &gcode, const bool &not_set_additional_fan, size_t layer_id, float layer_time, std::vector<PerExtruderAdjustments> &per_extruder_adjustments, float pause_seconds = 0.f);
 
 private :
 	GCodeEditor& operator=(const GCodeEditor&) = delete;

@@ -1567,6 +1567,8 @@ PRINT_CONFIG_CLASS_DERIVED_DEFINE(
     ((ConfigOptionInts,               optional_cooling_fan_speed))
     ((ConfigOptionBool,               reduce_crossing_wall))
     ((ConfigOptionBool,               z_direction_outwall_speed_continuous))
+    ((ConfigOptionFloat,              layer_time_max_delta))
+    ((ConfigOptionBool,               layer_time_delta_pause))
     ((ConfigOptionFloatOrPercent,     max_travel_detour_distance))
     ((ConfigOptionBool,               avoid_crossing_wall_includes_support))
     ((ConfigOptionPoints,             printable_area))

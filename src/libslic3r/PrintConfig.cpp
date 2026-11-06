@@ -1723,6 +1723,29 @@ void PrintConfigDef::init_fff_params()
     def->mode     = comAdvanced;
     def->set_default_value(new ConfigOptionBool(false));
 
+    def = this->add("layer_time_max_delta", coFloat);
+    def->label = L("Max layer time difference");
+    def->category = L("Quality");
+    def->tooltip = L("Limit how much the time of a layer may differ from the time of the layer below and above it. "
+                     "Layers that are faster than their neighbours are slowed down until the difference is within this limit, "
+                     "which evens out cooling from layer to layer and improves surface consistency. "
+                     "A long layer next to short ones makes several layers slow down, so print time increases. "
+                     "The first layer is not affected and this does not work on spiral vase mode. Zero to disable.");
+    def->sidetext = L("s");
+    def->min = 0;
+    def->max = 3600;
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionFloat(0));
+
+    def = this->add("layer_time_delta_pause", coBool);
+    def->label = L("Pause to reach the layer time limit");
+    def->category = L("Quality");
+    def->tooltip = L("When slowing a layer down is not enough to stay within the max layer time difference "
+                     "(for example because of the prime tower or the minimum print speed), retract, lift the nozzle away from the print "
+                     "after the layer and wait for the remaining time. Needs a max layer time difference above zero.");
+    def->mode = comAdvanced;
+    def->set_default_value(new ConfigOptionBool(false));
+
     def = this->add("max_travel_detour_distance", coFloatOrPercent);
     def->label = L("Avoid crossing wall - Max detour length");
     def->category = L("Quality");
